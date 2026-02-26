@@ -27,23 +27,17 @@ import pandas as pd
 import tldextract
 from ddgs import DDGS
 
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-
 DEFAULT_INPUT  = "heavy_equipment_michigan_leads.csv"
 DEFAULT_OUTPUT = "heavy_equipment_michigan_leads_with_domains.csv"
 
-# Seconds to sleep between searches (random jitter between MIN and MAX).
-# DDG's free tier is lenient, but anything faster than ~1 req/sec risks a
-# 202 / Ratelimit response.  2–4 s is safe for a one-off 45-row run.
+# delay between DDG queries (they'll rate limit you if you go too fast)
 DELAY_MIN = 2.0
 DELAY_MAX = 4.0
 
-# Number of retries on rate-limit / connection errors before giving up.
+# bail out after this many retries on network errors
 MAX_RETRIES = 3
 
-# Domains to skip — these are generic directories, not the dealer's own site.
+# skip these junk results (marketplace listings, social media, etc)
 SKIP_DOMAINS = {
     "machinerytrader.com", "ironplanet.com", "equipmenttrader.com",
     "yellowpages.com", "yelp.com", "facebook.com", "linkedin.com",
@@ -55,10 +49,6 @@ SKIP_DOMAINS = {
     "apple.com", "maps.apple.com",
 }
 
-# ---------------------------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -66,26 +56,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
 def build_queries(company: str, city: str, state: str) -> list[str]:
-    """
-    Return a tiered list of queries to try in order.
-
-    Why no exact quotes?  DDG (and its Bing backend) returns zero organic
-    results for obscure local SMBs when the name is wrapped in "quotes" —
-    the index simply doesn't have an exact-phrase match.  Unquoted queries
-    let DDG apply its own relevance ranking and still surface the right site.
-
-    Tier 1 — tightest: full name + location + industry signal
-    Tier 2 — looser:   full name + state only (drops city noise)
-    Tier 3 — bare:     full name + state (no industry term, catches
-                        companies whose sites don't use "equipment dealer")
-    """
-    co    = company.title()   # "AIS CONSTRUCTION" → "Ais Construction" (less spammy)
-    state_full = "Michigan"   # spell out for better geo disambiguation
+    """Build fallback queries for DDG search (tightest to loosest)."""
+    # unquoted queries work way better for local SMBs on DDG
+    co    = company.title()
+    state_full = "Michigan"
     return [
         f"{co} {city} {state_full} equipment dealer",
         f"{co} {state_full} equipment dealer",
@@ -94,10 +69,7 @@ def build_queries(company: str, city: str, state: str) -> list[str]:
 
 
 def extract_root_domain(url: str) -> str:
-    """
-    Given any URL, return the registrable root domain.
-    e.g. https://www.aisparts.com/contact  →  aisparts.com
-    """
+    """Extract root domain from any URL (handles subdomains/paths)."""
     ext = tldextract.extract(url)
     if ext.domain and ext.suffix:
         return f"{ext.domain}.{ext.suffix}".lower()
@@ -110,12 +82,8 @@ def is_valid_result(domain: str, skip_set: set) -> bool:
 
 
 def search_domain_one(ddgs: DDGS, query: str, skip_set: set) -> str:
-    """
-    Run a single DDG text search and return the first root domain that
-    passes the skip-list filter.  Returns "" if nothing useful is found.
-    Raises on network/rate-limit errors (caller handles retries).
-    """
-    results = ddgs.text(query, max_results=6)   # list, not generator
+    """One DDG query, return first useful domain or empty string."""
+    results = ddgs.text(query, max_results=6)
     if not results:
         return ""
     for hit in results:
@@ -125,13 +93,8 @@ def search_domain_one(ddgs: DDGS, query: str, skip_set: set) -> str:
             return domain
     return ""
 
-
-# ---------------------------------------------------------------------------
-# MAIN PIPELINE
-# ---------------------------------------------------------------------------
-
 def run(input_file: str, output_file: str):
-    # ---- Load CSV ----
+    # load the lead list
     df = pd.read_csv(input_file, dtype=str).fillna("")
     required = {"company", "city", "state"}
     missing = required - set(df.columns)
@@ -140,14 +103,13 @@ def run(input_file: str, output_file: str):
 
     log.info(f"Loaded {len(df)} rows from '{input_file}'")
 
-    # ---- Resume support: skip rows that already have a website ----
+    # skip rows that already have a domain (supports resuming)
     if "website" not in df.columns:
         df["website"] = ""
 
     rows_to_search = df[df["website"] == ""].index.tolist()
     log.info(f"Rows needing search: {len(rows_to_search)}")
 
-    # ---- Search loop ----
     with DDGS() as ddgs:
         for pos, idx in enumerate(rows_to_search, start=1):
             row     = df.loc[idx]
@@ -160,7 +122,7 @@ def run(input_file: str, output_file: str):
 
             domain = ""
 
-            # --- Tiered query loop ---
+            # try increasingly broad queries until we find something
             for tier, query in enumerate(queries, start=1):
                 if domain:
                     break
@@ -171,7 +133,7 @@ def run(input_file: str, output_file: str):
                         domain = search_domain_one(ddgs, query, SKIP_DOMAINS)
                         if domain:
                             log.info(f"  ✓  [{tier}] Found: {domain}")
-                        break   # success (even if empty) — move to next tier
+                        break   # got a result (or confirmed nothing), move to next tier
                     except Exception as exc:
                         err_msg = str(exc)
                         if attempt < MAX_RETRIES:
@@ -182,7 +144,7 @@ def run(input_file: str, output_file: str):
                         else:
                             log.error(f"  ✗  Tier {tier} failed after {MAX_RETRIES} attempts: {err_msg}")
 
-                # Brief pause between tiers so we don't hammer DDG
+                # don't hammer DDG between queries
                 if tier < len(queries) and not domain:
                     time.sleep(random.uniform(1.0, 2.0))
 
@@ -191,16 +153,15 @@ def run(input_file: str, output_file: str):
 
             df.at[idx, "website"] = domain
 
-            # ---- Save checkpoint after every row ----
-            # This means a crash won't lose work already done.
+            # checkpoint after every row so a crash doesn't lose progress
             df.to_csv(output_file, index=False, encoding="utf-8")
 
-            # ---- Polite delay (skip after last row) ----
+            # throttle between requests (last row skip not needed, we're done anyway)
             if pos < len(rows_to_search):
                 sleep_for = random.uniform(DELAY_MIN, DELAY_MAX)
                 time.sleep(sleep_for)
 
-    # ---- Final save & summary ----
+    # final save and stats
     df.to_csv(output_file, index=False, encoding="utf-8")
     found   = df["website"].ne("").sum()
     total   = len(df)
@@ -209,11 +170,6 @@ def run(input_file: str, output_file: str):
     log.info(f"  Domains found : {found}/{total}  ({found/total*100:.0f}%)")
     log.info(f"  Missing       : {total - found}")
     log.info("=" * 60)
-
-
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Heavy Equipment Domain Bridge")
