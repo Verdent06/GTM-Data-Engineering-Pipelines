@@ -9,8 +9,8 @@ import random
 import requests
 import pandas as pd
 
-DEFAULT_INPUT  = "chasi_michigan_leads_with_domains.csv"
-DEFAULT_OUTPUT = "chasi_michigan_leads_enriched.csv"
+DEFAULT_INPUT  = "heavy_equipment_michigan_leads_with_domains.csv"
+DEFAULT_OUTPUT = "heavy_equipment_michigan_leads_enriched.csv"
 
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
 
@@ -208,7 +208,7 @@ def run(input_file: str, output_file: str):
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chasi Lead Enrichment v4 — Hunter.io")
+    parser = argparse.ArgumentParser(description="Heavy Equipment Lead Enrichment v4 — Hunter.io")
     parser.add_argument("--input",  default=DEFAULT_INPUT,
                         help=f"Cleaned CSV with website column (default: {DEFAULT_INPUT})")
     parser.add_argument("--output", default=DEFAULT_OUTPUT,

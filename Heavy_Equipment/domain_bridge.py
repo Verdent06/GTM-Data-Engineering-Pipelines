@@ -1,9 +1,9 @@
 """
-domain_bridge.py — Chasi Domain Bridge
+domain_bridge.py — Domain Bridge
 =======================================
-Reads chasi_michigan_leads.csv, searches DuckDuckGo for each company's
+Reads heavy_equipment_michigan_leads.csv, searches DuckDuckGo for each company's
 website, extracts the root domain from the first organic result, and
-writes chasi_michigan_leads_with_domains.csv with a `website` column appended.
+writes heavy_equipment_michigan_leads_with_domains.csv with a `website` column appended.
 
 Install deps:
     pip install ddgs pandas tldextract
@@ -31,8 +31,8 @@ from ddgs import DDGS
 # CONFIG
 # ---------------------------------------------------------------------------
 
-DEFAULT_INPUT  = "chasi_michigan_leads.csv"
-DEFAULT_OUTPUT = "chasi_michigan_leads_with_domains.csv"
+DEFAULT_INPUT  = "heavy_equipment_michigan_leads.csv"
+DEFAULT_OUTPUT = "heavy_equipment_michigan_leads_with_domains.csv"
 
 # Seconds to sleep between searches (random jitter between MIN and MAX).
 # DDG's free tier is lenient, but anything faster than ~1 req/sec risks a
@@ -216,7 +216,7 @@ def run(input_file: str, output_file: str):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chasi Domain Bridge")
+    parser = argparse.ArgumentParser(description="Heavy Equipment Domain Bridge")
     parser.add_argument("--input",  default=DEFAULT_INPUT,
                         help=f"Path to input CSV (default: {DEFAULT_INPUT})")
     parser.add_argument("--output", default=DEFAULT_OUTPUT,
