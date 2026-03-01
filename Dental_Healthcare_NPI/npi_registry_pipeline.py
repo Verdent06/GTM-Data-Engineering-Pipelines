@@ -4,8 +4,10 @@ import pandas as pd
 import logging
 import os
 import argparse
+import re
 from dataclasses import dataclass, asdict
 from typing import Optional
+from urllib.parse import urlparse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +42,20 @@ PRACTICE_MANAGER_KEYWORDS = [
     "practice manager", "office manager", "owner", "dental director", "administrator"
 ]
 
+DENTIST_TITLE_PATTERNS = [
+    r',?\s+D\.?D\.?S\.?(?:\s|,|$)',
+    r',?\s+D\.?M\.?D\.?(?:\s|,|$)',
+    r',?\s+D\.?D\.?S\.?,?\s+.*?(?:P\.?C\.?|PLLC|LLC|P\.?A\.?)',
+    r',?\s+D\.?D\.?S\.?,?\s+.*?(?:M\.?A\.?|B\.?A\.?|B\.?S\.?)',
+    r',?\s+P\.?C\.?(?:\s|$)',
+    r',?\s+P\.?L\.?L\.?C\.?(?:\s|$)',
+    r',?\s+P\.?A\.?(?:\s|$)',
+    r',?\s+LLC\.?(?:\s|$)',
+    r'"?\s*"?\s*D\.?D\.?S\.?.*',
+    r'"?\s*[A-Z][A-Z\s\.]+DDS',
+    r'"?\s*[A-Z][A-Z\s\.]+DMD',
+]
+
 
 @dataclass
 class DentalClinicRecord:
@@ -68,6 +84,52 @@ def _extract_contact_from_position(position: str) -> bool:
         if keyword in position_lower:
             return True
     return False
+
+
+def _clean_clinic_name(clinic_name: str) -> str:
+    """Remove dentist titles (D.D.S., D.M.D.) and punctuation/quotes from clinic name."""
+    if not clinic_name:
+        return ""
+    
+    cleaned = clinic_name.strip()
+    
+    # Remove leading quotes and periods
+    cleaned = re.sub(r'^["\']', "", cleaned)
+    cleaned = re.sub(r'^\s*\.\s*', "", cleaned)
+    
+    # Remove dentist title patterns
+    for pattern in DENTIST_TITLE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    
+    # If there's a quote/apostrophe with content before it, extract only clinic name part
+    if '"' in cleaned:
+        # Extract text within quotes or before quotes
+        match = re.search(r'^"?([^"]+?)(?:"\s+|"$)', cleaned)
+        if match:
+            cleaned = match.group(1).strip()
+        else:
+            cleaned = re.sub(r'^"', "", cleaned)
+            cleaned = re.sub(r'"$', "", cleaned)
+    
+    # Remove trailing punctuation
+    cleaned = re.sub(r'["\']$', "", cleaned)
+    
+    # Clean up extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
+
+
+def _extract_root_domain(url: str) -> str:
+    """Extract root domain from URL."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
 
 
 async def fetch_npi_clinics(session: aiohttp.ClientSession, target_limit: int = DEFAULT_CLINIC_LIMIT) -> list[DentalClinicRecord]:
@@ -170,72 +232,106 @@ async def fetch_npi_clinics(session: aiohttp.ClientSession, target_limit: int = 
 async def discover_domains(records: list[DentalClinicRecord]) -> list[DentalClinicRecord]:
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 2: DOMAIN DISCOVERY (Clearbit Autocomplete API)")
+    log.info("STAGE 2: DOMAIN DISCOVERY (Clearbit → DuckDuckGo Fallback)")
     log.info("=" * 70)
     
     found = 0
     blocked = 0
     not_found = 0
+    clearbit_hits = 0
+    ddgs_hits = 0
+    
+    try:
+        from ddgs import DDGS
+        ddgs = DDGS()
+        has_ddgs = True
+    except ImportError:
+        log.warning("  ⚠ 'ddgs' library not installed. DuckDuckGo fallback disabled.")
+        log.warning("  Run: pip install ddgs")
+        ddgs = None
+        has_ddgs = False
     
     for i, record in enumerate(records):
         log.info(f"  [{i+1}/{len(records)}] Searching: {record.clinic_name[:50]}...")
         
-        params = {"query": record.clinic_name}
+        domain_found = False
         
-        try:
-            async with aiohttp.ClientSession() as session:
+        cleaned_name = _clean_clinic_name(record.clinic_name)
+        log.info(f"    Cleaned name: {cleaned_name[:50]}")
+        
+        async with aiohttp.ClientSession() as session:
+            params = {"query": cleaned_name}
+            
+            try:
                 async with session.get(
                     CLEARBIT_URL,
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
-                    if resp.status != 200:
-                        log.warning(f"    ⚠ Clearbit HTTP {resp.status}")
-                        not_found += 1
-                        await asyncio.sleep(1)
+                    if resp.status == 200:
+                        data = await resp.json()
+                        
+                        if data and len(data) > 0:
+                            domain = data[0].get("domain")
+                            if domain and not _is_aggregator_domain(domain):
+                                record.website = domain
+                                log.info(f"    ✓ CLEARBIT: {domain}")
+                                found += 1
+                                clearbit_hits += 1
+                                domain_found = True
+                            elif domain:
+                                log.info(f"    ✗ CLEARBIT BLOCKED: {domain} (aggregator)")
+                                blocked += 1
+                                domain_found = True
+            
+            except Exception as e:
+                log.warning(f"    ⚠ Clearbit error: {e}")
+        
+        if domain_found:
+            await asyncio.sleep(1)
+            continue
+        
+        if has_ddgs:
+            log.info(f"    ↳ Trying DuckDuckGo fallback...")
+            query = f'"{cleaned_name}" {record.city} {record.state} dental practice website'
+            
+            try:
+                ddgs_results = await asyncio.to_thread(ddgs.text, query, max_results=5)
+                
+                for result in ddgs_results:
+                    href = result.get("href", "")
+                    domain = _extract_root_domain(href)
+                    
+                    if not domain:
                         continue
                     
-                    data = await resp.json()
-        
-        except Exception as e:
-            log.warning(f"    ⚠ Clearbit error: {e}")
-            not_found += 1
-            await asyncio.sleep(1)
-            continue
-        
-        if not data or len(data) == 0:
-            log.info(f"    ⚠ No results from Clearbit")
-            not_found += 1
-            await asyncio.sleep(1)
-            continue
-        
-        try:
-            domain = data[0].get("domain")
-            if not domain:
-                log.info(f"    ⚠ No domain in first result")
-                not_found += 1
-                await asyncio.sleep(1)
-                continue
+                    if _is_aggregator_domain(domain):
+                        log.info(f"    ⚠ DDGS result blocked: {domain} (aggregator)")
+                        continue
+                    
+                    record.website = domain
+                    log.info(f"    ✓ DDGS: {domain}")
+                    found += 1
+                    ddgs_hits += 1
+                    domain_found = True
+                    break
             
-            if _is_aggregator_domain(domain):
-                log.info(f"    ✗ BLOCKED: {domain} (aggregator)")
-                blocked += 1
-            else:
-                record.website = domain
-                log.info(f"    ✓ FOUND: {domain}")
-                found += 1
+            except Exception as e:
+                log.warning(f"    ⚠ DuckDuckGo error: {e}")
         
-        except Exception as e:
-            log.warning(f"    ⚠ Parse error: {e}")
+        if not domain_found:
+            log.info(f"    ⚠ No domain found")
             not_found += 1
         
         await asyncio.sleep(1)
     
     log.info("")
     log.info(f"  Domain Discovery Summary:")
-    log.info(f"    ✓ Found:      {found}")
-    log.info(f"    ✗ Blocked:    {blocked} (aggregator domains rejected)")
-    log.info(f"    ⚠ Not found:  {not_found}")
+    log.info(f"    ✓ Found:        {found}")
+    log.info(f"      - Clearbit:   {clearbit_hits}")
+    log.info(f"      - DuckDuckGo: {ddgs_hits}")
+    log.info(f"    ✗ Blocked:      {blocked} (aggregator domains rejected)")
+    log.info(f"    ⚠ Not found:    {not_found}")
     
     return records
 
