@@ -19,20 +19,24 @@ log = logging.getLogger(__name__)
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
 OUTPUT_FILE = "dental_clinics_leads.csv"
 
-DEFAULT_CLINIC_LIMIT = 20
+DEFAULT_CLINIC_LIMIT = 150
 TEST_MAX_CLINICS = 5
 TEST_MAX_HUNTER_CALLS = 5
 
 NPPES_BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
-CLEARBIT_URL = "https://autocomplete.clearbit.com/v1/companies/suggest"
 HUNTER_URL = "https://api.hunter.io/v2/domain-search"
 
 AGGREGATOR_DOMAINS = [
     "yelp.com", "healthgrades.com", "zocdoc.com",
+    "vitadox.com", "smartdentalnetwork.com", "vitals.com", "caredash.com", "sharecare.com",
+    "webmd.com", "1800dentist.com", "dentistry.com", "smilebox.com", "ratemds.com",
+    "wellness.com", "healthcare4ppl.com", "doctor.com", "doximity.com", "nameberry.com",
+    "britannica.com", "usnews.com", "buzzfile.com", "bizapedia.com", "opendi.com",
+    "hipaaspace.com", "docinfo.org", "chamberofcommerce.com", "mapquest.com",
     "facebook.com", "linkedin.com", "twitter.com", "instagram.com",
     "nextdoor.com", "thumbtack.com", "alignable.com",
     "yellowpages.com", "whitepages.com", "superpages.com", "manta.com",
-    "mapquest.com", "bbb.org", "chamberofcommerce.com", "dandb.com",
+    "bbb.org", "dandb.com",
     "indeed.com", "glassdoor.com", "ziprecruiter.com", "careerbuilder.com",
     "cms.gov", "google.com", "bing.com", "youtube.com", "wikipedia.org",
     "amazon.com", "apps.apple.com", "play.google.com",
@@ -40,6 +44,11 @@ AGGREGATOR_DOMAINS = [
 
 PRACTICE_MANAGER_KEYWORDS = [
     "practice manager", "office manager", "owner", "dental director", "administrator"
+]
+
+FORBIDDEN_DOMAIN_KEYWORDS = [
+    "npi", "wiki", "dictionary", "bible", "directory", "review", 
+    "vitals", "grades", "lookup", "finda", "yellow", "whitepages"
 ]
 
 DENTIST_TITLE_PATTERNS = [
@@ -73,6 +82,25 @@ def _is_aggregator_domain(domain: str) -> bool:
     domain_lower = domain.lower()
     for blocked in AGGREGATOR_DOMAINS:
         if blocked in domain_lower:
+            return True
+    return False
+
+
+def _is_non_us_tld(domain: str) -> bool:
+    """Check if domain ends in non-US TLD (.gov, .edu, .uk, .ca, .au)."""
+    domain_lower = domain.lower()
+    non_us_tlds = [".gov", ".edu", ".uk", ".ca", ".au", ".nz"]
+    for tld in non_us_tlds:
+        if domain_lower.endswith(tld):
+            return True
+    return False
+
+
+def _has_forbidden_keywords(domain: str) -> bool:
+    """Check if domain contains forbidden keywords (NPI scrapers, wikis, directories, etc.)."""
+    domain_lower = domain.lower()
+    for keyword in FORBIDDEN_DOMAIN_KEYWORDS:
+        if keyword in domain_lower:
             return True
     return False
 
@@ -232,106 +260,93 @@ async def fetch_npi_clinics(session: aiohttp.ClientSession, target_limit: int = 
 async def discover_domains(records: list[DentalClinicRecord]) -> list[DentalClinicRecord]:
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 2: DOMAIN DISCOVERY (Clearbit → DuckDuckGo Fallback)")
+    log.info("STAGE 2: DOMAIN DISCOVERY (DuckDuckGo - US Local Domains Only)")
     log.info("=" * 70)
     
     found = 0
     blocked = 0
     not_found = 0
-    clearbit_hits = 0
-    ddgs_hits = 0
+    tld_rejected = 0
+    keyword_rejected = 0
     
     try:
         from ddgs import DDGS
         ddgs = DDGS()
         has_ddgs = True
     except ImportError:
-        log.warning("  ⚠ 'ddgs' library not installed. DuckDuckGo fallback disabled.")
+        log.warning("  ⚠ 'ddgs' library not installed. Domain discovery disabled.")
         log.warning("  Run: pip install ddgs")
         ddgs = None
         has_ddgs = False
+        return records
+    
+    if not has_ddgs:
+        return records
     
     for i, record in enumerate(records):
         log.info(f"  [{i+1}/{len(records)}] Searching: {record.clinic_name[:50]}...")
         
         domain_found = False
-        
         cleaned_name = _clean_clinic_name(record.clinic_name)
         log.info(f"    Cleaned name: {cleaned_name[:50]}")
         
-        async with aiohttp.ClientSession() as session:
-            params = {"query": cleaned_name}
-            
-            try:
-                async with session.get(
-                    CLEARBIT_URL,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        
-                        if data and len(data) > 0:
-                            domain = data[0].get("domain")
-                            if domain and not _is_aggregator_domain(domain):
-                                record.website = domain
-                                log.info(f"    ✓ CLEARBIT: {domain}")
-                                found += 1
-                                clearbit_hits += 1
-                                domain_found = True
-                            elif domain:
-                                log.info(f"    ✗ CLEARBIT BLOCKED: {domain} (aggregator)")
-                                blocked += 1
-                                domain_found = True
-            
-            except Exception as e:
-                log.warning(f"    ⚠ Clearbit error: {e}")
+        query = f'"{cleaned_name}" dentist {record.city} {record.state} official website'
+        log.info(f"    Query: {query[:70]}...")
         
-        if domain_found:
-            await asyncio.sleep(1)
-            continue
-        
-        if has_ddgs:
-            log.info(f"    ↳ Trying DuckDuckGo fallback...")
-            query = f'"{cleaned_name}" {record.city} {record.state} dental practice website'
+        try:
+            ddgs_results = await asyncio.to_thread(ddgs.text, query, max_results=5)
             
-            try:
-                ddgs_results = await asyncio.to_thread(ddgs.text, query, max_results=5)
-                
-                for result in ddgs_results:
-                    href = result.get("href", "")
-                    domain = _extract_root_domain(href)
-                    
-                    if not domain:
-                        continue
-                    
-                    if _is_aggregator_domain(domain):
-                        log.info(f"    ⚠ DDGS result blocked: {domain} (aggregator)")
-                        continue
-                    
-                    record.website = domain
-                    log.info(f"    ✓ DDGS: {domain}")
-                    found += 1
-                    ddgs_hits += 1
-                    domain_found = True
+            for result in ddgs_results:
+                if domain_found:
                     break
-            
-            except Exception as e:
-                log.warning(f"    ⚠ DuckDuckGo error: {e}")
+                
+                href = result.get("href", "")
+                domain = _extract_root_domain(href)
+                
+                if not domain:
+                    continue
+                
+                # Check for forbidden keywords (NPI scrapers, wikis, directories, etc.)
+                if _has_forbidden_keywords(domain):
+                    log.info(f"    ⚠ KEYWORD rejected: {domain} (forbidden keyword)")
+                    keyword_rejected += 1
+                    continue
+                
+                # Check for non-US TLDs and government/educational domains
+                if _is_non_us_tld(domain):
+                    log.info(f"    ⚠ TLD rejected (non-US or restricted): {domain}")
+                    tld_rejected += 1
+                    continue
+                
+                # Check aggregator blocklist
+                if _is_aggregator_domain(domain):
+                    log.info(f"    ⚠ Blocked: {domain} (aggregator/directory)")
+                    blocked += 1
+                    continue
+                
+                # Valid domain found
+                record.website = domain
+                log.info(f"    ✓ FOUND: {domain}")
+                found += 1
+                domain_found = True
+                break
+        
+        except Exception as e:
+            log.warning(f"    ⚠ DuckDuckGo error: {e}")
         
         if not domain_found:
-            log.info(f"    ⚠ No domain found")
+            log.info(f"    ⚠ No valid US local domain found")
             not_found += 1
         
         await asyncio.sleep(1)
     
     log.info("")
     log.info(f"  Domain Discovery Summary:")
-    log.info(f"    ✓ Found:        {found}")
-    log.info(f"      - Clearbit:   {clearbit_hits}")
-    log.info(f"      - DuckDuckGo: {ddgs_hits}")
-    log.info(f"    ✗ Blocked:      {blocked} (aggregator domains rejected)")
-    log.info(f"    ⚠ Not found:    {not_found}")
+    log.info(f"    ✓ Found:            {found} (US local domains)")
+    log.info(f"    ✗ Blocked:          {blocked} (aggregator/directory sites)")
+    log.info(f"    ✗ TLD Rejected:     {tld_rejected} (non-US/gov/edu: .gov, .edu, .uk, .ca, .au, .nz)")
+    log.info(f"    ✗ Keyword Rejected: {keyword_rejected} (NPI scrapers, wikis, directories)")
+    log.info(f"    ⚠ Not found:        {not_found}")
     
     return records
 
@@ -443,7 +458,7 @@ async def enrich_all(records: list[DentalClinicRecord], max_api_calls: Optional[
     no_domain_count = 0
     
     for r in records:
-        if not r.website:
+        if not r.website or not r.website.strip():
             no_domain_count += 1
             continue
         
