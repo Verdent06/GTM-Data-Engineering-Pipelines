@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import argparse
+from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import Optional
 from urllib.parse import urlparse
@@ -18,33 +19,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 
-OUTPUT_FILE = "healthcare_agencies_fl_leads.csv"
-STATE_FILTER = "FL"
+OUTPUT_FILE = "healthcare_agencies_fl_tx_az_leads.csv"
+STATE_FILTER: list[str] = ["FL", "TX", "AZ"]
 
 CMS_DATASTORE_BASE = "https://data.cms.gov/provider-data/api/1/datastore/query/6jpm-sxkc/0"
 CMS_PAGE_SIZE = 1500
 
 MAX_ENRICHMENT_CONCURRENCY = 5
-MAX_ENRICHMENT_ATTEMPTS = 5
-APOLLO_RPM = 50
-DDGS_DELAY_SECONDS = 3
+
+# MochaCare pitch: never exceed 100 Hunter Domain Search calls per run (strict cap).
+MAX_HUNTER_VIP_ENRICHMENTS = 100
+# Hunter.io account ceiling (for logging only).
+HUNTER_ACCOUNT_CREDIT_LIMIT = 500
 
 AGGREGATOR_DOMAINS = [
-    "yelp.com", "facebook.com", "linkedin.com", "twitter.com", "instagram.com",
-    "nextdoor.com", "thumbtack.com", "alignable.com",
-    "yellowpages.com", "whitepages.com", "superpages.com", "manta.com",
-    "mapquest.com", "bbb.org", "chamberofcommerce.com", "dandb.com",
-    "indeed.com", "glassdoor.com", "ziprecruiter.com", "careerbuilder.com",
-    "caring.com", "medicare.gov", "healthgrades.com", "carelist.com",
-    "agingcare.com", "senioradvisor.com", "aplaceformom.com", "care.com",
-    "homecare.com", "homecareassistance.com", "visitingangels.com",
-    "healthcare4ppl.com", "healthcarecomps.com",
-    "cms.gov", "ahca.myflorida.com", "floridahealthfinder.gov",
-    "google.com", "bing.com", "youtube.com", "wikipedia.org", "amazon.com",
-    "apps.apple.com", "play.google.com",
+    "npino.com", "senioradvice.com", "github.io"
 ]
 
 @dataclass
@@ -61,7 +53,9 @@ class HHARecord:
     owner_title: str = ""
     owner_email: str = ""
     email_source: str = ""
-    apollo_org_id: str = ""
+    ownership_type: str = ""
+    star_rating: str = ""
+    lead_score: int = 0
 
 
 async def fetch_cms_hha_data(session: aiohttp.ClientSession, limit: Optional[int] = None) -> list[HHARecord]:
@@ -126,12 +120,15 @@ async def fetch_cms_hha_data(session: aiohttp.ClientSession, limit: Optional[int
     
     df = pd.DataFrame(all_records)
     
-    log.info(f"  Filtering for state = '{STATE_FILTER}'")
-    df_fl = df[df['state'] == STATE_FILTER]
-    log.info(f"  Florida records: {len(df_fl)}")
+    log.info(f"  Filtering for states: {STATE_FILTER}")
+    df_states = df[df["state"].isin(STATE_FILTER)]
+    for st in STATE_FILTER:
+        n = int((df["state"] == st).sum())
+        log.info(f"    {st}: {n} records (pre-limit)")
+    log.info(f"  Combined target-state records: {len(df_states)}")
     
     if limit:
-        df_fl = df_fl.head(limit)
+        df_states = df_states.head(limit)
         log.info(f"  TEST MODE: Limited to {limit} rows")
     
     COL_NAME = 'provider_name'
@@ -150,24 +147,29 @@ async def fetch_cms_hha_data(session: aiohttp.ClientSession, limit: Optional[int
     log.info(f"    CCN:     {COL_CCN}")
     
     records = []
-    for _, row in df_fl.iterrows():
+    for _, row in df_states.iterrows():
         name = str(row.get(COL_NAME, "")).strip() if pd.notna(row.get(COL_NAME)) else ""
         
         if not name:
             continue
         
+        st_val = row.get("state", "")
+        row_state = str(st_val).strip().upper() if pd.notna(st_val) else ""
+        
         record = HHARecord(
             agency_name=name,
             address=str(row.get(COL_ADDRESS, "")).strip() if pd.notna(row.get(COL_ADDRESS)) else "",
             city=str(row.get(COL_CITY, "")).strip() if pd.notna(row.get(COL_CITY)) else "",
-            state=STATE_FILTER,
+            state=row_state,
             zip_code=str(row.get(COL_ZIP, ""))[:5] if pd.notna(row.get(COL_ZIP)) else "",
             phone=_format_phone(row.get(COL_PHONE, "")),
             cms_ccn=str(row.get(COL_CCN, "")).strip() if pd.notna(row.get(COL_CCN)) else "",
+            ownership_type=str(row.get("type_of_ownership", "")).strip() if pd.notna(row.get("type_of_ownership")) else "",
+            star_rating=str(row.get("quality_of_patient_care_star_rating", "")).strip() if pd.notna(row.get("quality_of_patient_care_star_rating")) else "",
         )
         records.append(record)
     
-    log.info(f"  ✓ Extracted {len(records)} Florida HHAs from CMS Datastore API")
+    log.info(f"  ✓ Extracted {len(records)} HHAs from CMS ({', '.join(STATE_FILTER)})")
     return records
 
 
@@ -202,58 +204,82 @@ def _is_aggregator_domain(domain: str) -> bool:
 async def discover_domains(records: list[HHARecord]) -> list[HHARecord]:
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 2: DOMAIN DISCOVERY (DuckDuckGo)")
+    log.info("STAGE 3: DOMAIN DISCOVERY (Google Places API)")
     log.info("=" * 70)
     
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        log.error("  ✗ 'ddgs' library not installed. Run: pip install ddgs")
+    if not GOOGLE_PLACES_API_KEY:
+        log.error("  ✗ GOOGLE_PLACES_API_KEY not set.")
+        log.error("  Set GOOGLE_PLACES_API_KEY environment variable.")
         return records
     
-    ddgs = DDGS()
     found = 0
     blocked = 0
     not_found = 0
     
-    for i, record in enumerate(records):
-        log.info(f"  [{i+1}/{len(records)}] Searching: {record.agency_name[:50]}...")
-        
-        query = f'"{record.agency_name}" {record.city} FL home care agency website'
-        
-        try:
-            results = ddgs.text(query, max_results=5, backend="auto")
-        except Exception as e:
-            log.warning(f"    ⚠ Search failed: {e}")
-            not_found += 1
-            await asyncio.sleep(DDGS_DELAY_SECONDS)
-            continue
-        
-        domain_found = False
-        for result in results:
-            href = result.get("href", "")
-            domain = _extract_root_domain(href)
+    async with aiohttp.ClientSession() as session:
+        for i, record in enumerate(records):
+            log.info(f"  [{i+1}/{len(records)}] Searching: {record.agency_name[:50]}...")
             
-            if not domain:
-                continue
+            query = f"{record.agency_name} in {record.city}, {record.state} {record.zip_code}"
             
-            if _is_aggregator_domain(domain):
-                log.info(f"    ✗ BLOCKED: {domain} (aggregator)")
-                blocked += 1
-                continue
+            url = "https://places.googleapis.com/v1/places:searchText"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "places.websiteUri",
+            }
+            body = {
+                "textQuery": query,
+                "maxResultCount": 1
+            }
             
-            record.website = domain
-            log.info(f"    ✓ FOUND: {domain}")
-            found += 1
-            domain_found = True
-            break
-        
-        if not domain_found and not record.website:
-            log.info(f"    ⚠ No valid domain found")
-            not_found += 1
-        
-        if i < len(records) - 1:
-            await asyncio.sleep(DDGS_DELAY_SECONDS)
+            try:
+                async with session.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        log.warning(f"    ⚠ Google Places API HTTP {resp.status}")
+                        not_found += 1
+                        continue
+                    
+                    data = await resp.json()
+                
+                places = data.get("places", [])
+                if not places:
+                    log.info(f"    ⚠ No results found")
+                    not_found += 1
+                    continue
+                
+                place = places[0]
+                website_uri = place.get("websiteUri", "")
+                
+                if not website_uri:
+                    log.info(f"    ⚠ No website found in result")
+                    not_found += 1
+                    continue
+                
+                domain = _extract_root_domain(website_uri)
+                
+                if not domain:
+                    log.info(f"    ⚠ Invalid domain extracted from {website_uri}")
+                    not_found += 1
+                    continue
+                
+                if _is_aggregator_domain(domain):
+                    log.info(f"    ✗ BLOCKED: {domain} (aggregator)")
+                    blocked += 1
+                    continue
+                
+                record.website = domain
+                log.info(f"    ✓ FOUND: {domain}")
+                found += 1
+                
+            except Exception as e:
+                log.warning(f"    ⚠ Search failed: {e}")
+                not_found += 1
     
     log.info("")
     log.info(f"  Domain Discovery Summary:")
@@ -262,6 +288,48 @@ async def discover_domains(records: list[HHARecord]) -> list[HHARecord]:
     log.info(f"    ⚠ Not found:  {not_found}")
     
     return records
+
+
+def apply_anti_franchise_filter(
+    records: list[HHARecord], max_occurrences: int = 2
+) -> list[HHARecord]:
+    """
+    Drop records whose website appears more than max_occurrences times (shared domain = likely chain).
+    Empty/missing websites are kept (nothing to treat as a chain signature).
+    """
+    log.info("")
+    log.info("=" * 70)
+    log.info("STAGE 3.5: ANTI-FRANCHISE FILTER")
+    log.info("=" * 70)
+
+    def norm_site(w: str) -> str:
+        return (w or "").strip().lower()
+
+    non_empty_keys = [norm_site(r.website) for r in records if norm_site(r.website)]
+    freq = Counter(non_empty_keys)
+
+    kept: list[HHARecord] = []
+    purged = 0
+    for r in records:
+        key = norm_site(r.website)
+        if not key:
+            kept.append(r)
+            continue
+        if freq[key] > max_occurrences:
+            log.info(
+                f"  Dropped (chain): {r.agency_name[:60]} — "
+                f"website {key} appears {freq[key]}× (max {max_occurrences})"
+            )
+            purged += 1
+            continue
+        kept.append(r)
+
+    log.info("")
+    log.info(
+        f"  Anti-franchise summary: kept {len(kept)} record(s), "
+        f"purged {purged} chain lead(s) (shared domain > {max_occurrences} occurrence(s))"
+    )
+    return kept
 
 
 class EnrichmentClient:
@@ -275,6 +343,7 @@ class EnrichmentClient:
         self._request_count = 0
         self._window_start = time.monotonic()
         self._session: Optional[aiohttp.ClientSession] = None
+        self.hunter_credits_consumed = 0
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession()
@@ -288,105 +357,7 @@ class EnrichmentClient:
         if now - self._window_start >= 60:
             self._request_count = 0
             self._window_start = now
-        if self._request_count >= APOLLO_RPM:
-            wait = 60 - (now - self._window_start)
-            log.info(f"    ⏳ Apollo rate limit — sleeping {wait:.1f}s")
-            await asyncio.sleep(wait)
-            self._request_count = 0
-            self._window_start = time.monotonic()
         self._request_count += 1
-
-    async def enrich_via_apollo(self, agency_name: str, domain: str = "") -> dict:
-        if not APOLLO_API_KEY:
-            return {}
-
-        hdrs = {
-            "Content-Type": "application/json",
-            "X-Api-Key": APOLLO_API_KEY,
-            "Cache-Control": "no-cache"
-        }
-
-        await self._throttle()
-        org_body = {
-            "page": 1,
-            "per_page": 1,
-        }
-        
-        if domain:
-            org_body["q_organization_domains_list"] = [domain]
-        else:
-            org_body["q_organization_name"] = agency_name
-            org_body["organization_locations"] = ["Florida, United States"]
-
-        try:
-            async with self._session.post(
-                "https://api.apollo.io/api/v1/mixed_companies/search",
-                json=org_body, headers=hdrs,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status != 200:
-                    log.warning(f"    Apollo org HTTP {resp.status} for '{agency_name[:30]}'")
-                    return {}
-                data = await resp.json()
-            
-            orgs = data.get("organizations", []) or data.get("accounts", [])
-            if not orgs:
-                log.info(f"    Apollo: No org match for '{agency_name[:30]}'")
-                return {}
-            
-            org = orgs[0]
-            org_id = org.get("id", "")
-            org_domain = org.get("primary_domain") or org.get("domain") or domain
-            log.info(f"    ✓ Apollo org: {org.get('name', 'Unknown')[:30]} [{org_domain}]")
-            
-        except Exception as e:
-            log.error(f"    Apollo org error: {e}")
-            return {}
-
-        await self._throttle()
-        people_body = {
-            "organization_ids": [org_id],
-            "person_titles": self.TITLE_PRIORITY,
-            "page": 1,
-            "per_page": 10,
-        }
-        
-        try:
-            async with self._session.post(
-                "https://api.apollo.io/api/v1/people/search",
-                json=people_body, headers=hdrs,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status != 200:
-                    return {"apollo_org_id": org_id, "email_source": "apollo_no_people"}
-                data = await resp.json()
-                
-        except Exception as e:
-            log.error(f"    Apollo people error: {e}")
-            return {"apollo_org_id": org_id, "email_source": "apollo_error"}
-
-        people = data.get("people", [])
-        if not people:
-            log.info(f"    Apollo: No decision-makers found")
-            return {"apollo_org_id": org_id, "email_source": "apollo_no_people"}
-
-        def rank(p):
-            t = (p.get("title") or "").lower()
-            for i, kw in enumerate(self.TITLE_PRIORITY):
-                if kw in t:
-                    return i
-            return 99
-
-        best = sorted(people, key=rank)[0]
-        email = best.get("email", "")
-        
-        return {
-            "owner_name": f"{best.get('first_name', '')} {best.get('last_name', '')}".strip(),
-            "owner_title": best.get("title", ""),
-            "owner_email": email,
-            "apollo_org_id": org_id,
-            "email_source": "apollo" if email else "apollo_no_email",
-        }
 
     async def enrich_via_hunter(self, domain: str) -> dict:
         if not HUNTER_API_KEY or not domain:
@@ -401,6 +372,8 @@ class EnrichmentClient:
         }
         
         try:
+            # One Domain Search request ≈ one Hunter credit (count at send time).
+            self.hunter_credits_consumed += 1
             async with self._session.get(
                 "https://api.hunter.io/v2/domain-search",
                 params=params,
@@ -436,14 +409,7 @@ class EnrichmentClient:
     async def enrich(self, record: HHARecord) -> HHARecord:
         domain = record.website.strip()
         
-        result = await self.enrich_via_apollo(record.agency_name, domain)
-        
-        if not result.get("owner_email") and domain:
-            log.info(f"    ↳ Hunter fallback for: {domain}")
-            hunter = await self.enrich_via_hunter(domain)
-            for k, v in hunter.items():
-                if v and not result.get(k):
-                    result[k] = v
+        result = await self.enrich_via_hunter(domain)
         
         for k, v in result.items():
             if hasattr(record, k):
@@ -458,21 +424,24 @@ class EnrichmentClient:
 async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 3: APOLLO/HUNTER ENRICHMENT")
+    log.info("STAGE 4: HUNTER ENRICHMENT (VIP LEADS)")
     log.info("=" * 70)
     
-    if not APOLLO_API_KEY and not HUNTER_API_KEY:
-        log.warning("  ⚠ No API keys set. Skipping enrichment.")
-        log.warning("  Set APOLLO_API_KEY and/or HUNTER_API_KEY environment variables.")
+    if not HUNTER_API_KEY:
+        log.warning("  ⚠ HUNTER_API_KEY not set. Skipping enrichment.")
+        log.warning("  Set HUNTER_API_KEY environment variable.")
         return records
-    
-    log.info(f"  ⚠ HARD LIMIT: Will only enrich {MAX_ENRICHMENT_ATTEMPTS} valid domains (to save API credits)")
     
     valid_for_enrichment = []
     blocked_count = 0
     no_domain_count = 0
+    low_score_count = 0
     
     for r in records:
+        if r.lead_score < 95:
+            low_score_count += 1
+            continue
+        
         if not r.website:
             no_domain_count += 1
             continue
@@ -484,29 +453,47 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
         
         valid_for_enrichment.append(r)
     
-    log.info(f"  Records with valid domains: {len(valid_for_enrichment)}")
+    log.info(f"  Records with Score >= 95: {len(valid_for_enrichment)}")
+    log.info(f"  Records with Score < 95: {low_score_count}")
     log.info(f"  Records without domains: {no_domain_count}")
     log.info(f"  Records with blocked domains: {blocked_count}")
     
     if not valid_for_enrichment:
-        log.info("  No valid records to enrich.")
+        log.info("  No VIP leads to enrich.")
         return records
     
-    to_enrich = valid_for_enrichment[:MAX_ENRICHMENT_ATTEMPTS]
+    to_enrich = valid_for_enrichment[:MAX_HUNTER_VIP_ENRICHMENTS]
     skipped_due_to_limit = len(valid_for_enrichment) - len(to_enrich)
     
-    if skipped_due_to_limit > 0:
-        log.info(f"  ⚠ Skipping {skipped_due_to_limit} records due to hard limit")
+    if len(to_enrich) > MAX_HUNTER_VIP_ENRICHMENTS:
+        log.error("  ✗ HARD STOP: to_enrich exceeds MAX_HUNTER_VIP_ENRICHMENTS (logic error).")
+        to_enrich = to_enrich[:MAX_HUNTER_VIP_ENRICHMENTS]
     
-    log.info(f"  Will enrich: {len(to_enrich)} records")
+    log.info(f"  MochaCare pitch — Hunter HARD CAP: exactly {MAX_HUNTER_VIP_ENRICHMENTS} VIP Domain Search calls max per run.")
+    log.info(
+        f"  Hunter.io budget: this run will consume up to {len(to_enrich)} credit(s) "
+        f"(1 per domain); account ceiling {HUNTER_ACCOUNT_CREDIT_LIMIT} credits."
+    )
+    log.info(
+        f"  VIP pool: {len(valid_for_enrichment)} eligible (score 95+, valid domain). "
+        f"Enriching first {len(to_enrich)} only (slice [:MAX_HUNTER_VIP_ENRICHMENTS] enforced)."
+    )
+    
+    if skipped_due_to_limit > 0:
+        log.info(f"  ⚠ Skipping {skipped_due_to_limit} additional VIP(s) past the {MAX_HUNTER_VIP_ENRICHMENTS}-lead cap")
+    
     log.info("")
     
     enriched_map = {}
     enrichment_count = 0
+    credits_used = 0
     
     async with EnrichmentClient() as client:
         for i, rec in enumerate(to_enrich):
-            log.info(f"  [{i+1}/{len(to_enrich)}] Enriching: {rec.agency_name[:40]}... ({rec.website})")
+            if i >= MAX_HUNTER_VIP_ENRICHMENTS:
+                log.error("  ✗ HARD STOP: loop exceeded MAX_HUNTER_VIP_ENRICHMENTS — breaking.")
+                break
+            log.info(f"  [{i+1}/{len(to_enrich)}] Enriching: {rec.agency_name[:40]}... (Score: {rec.lead_score}, {rec.website})")
             
             try:
                 enriched_rec = await client.enrich(rec)
@@ -520,6 +507,7 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
                     
             except Exception as e:
                 log.error(f"    ✗ Error: {e}")
+        credits_used = client.hunter_credits_consumed
     
     final_records = []
     for r in records:
@@ -530,31 +518,77 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
     
     emails_found = sum(1 for r in enriched_map.values() if r.owner_email)
     
+    remaining_budget = max(0, HUNTER_ACCOUNT_CREDIT_LIMIT - credits_used)
+    
     log.info("")
     log.info(f"  Enrichment Summary:")
-    log.info(f"    ✓ Attempted: {enrichment_count}")
+    log.info(f"    ✓ Hunter Domain Search calls: {credits_used} (hard-capped at {MAX_HUNTER_VIP_ENRICHMENTS} per run)")
+    log.info(f"    ✓ Hunter.io credits consumed this run: {credits_used} (account limit {HUNTER_ACCOUNT_CREDIT_LIMIT}; ~{remaining_budget} left if starting at full quota)")
+    log.info(f"    ✓ Hunter loop completions (no exception): {enrichment_count}")
     log.info(f"    ✓ Emails found: {emails_found}/{enrichment_count}")
-    log.info(f"    ⚠ Unenriched (kept in CSV): {len(records) - enrichment_count}")
+    log.info(
+        f"    ℹ Rows unchanged by Hunter this run: {len(records) - len(enriched_map)} "
+        f"(capped past {MAX_HUNTER_VIP_ENRICHMENTS}, no domain, blocked domain, or errors)"
+    )
     
     return final_records
+
+
+def calculate_lead_scores(records: list[HHARecord]) -> list[HHARecord]:
+    log.info("")
+    log.info("=" * 70)
+    log.info("STAGE 2: LEAD SCORING")
+    log.info("=" * 70)
+    
+    for record in records:
+        score = 50
+        
+        if record.ownership_type:
+            ownership_upper = record.ownership_type.upper()
+            if "PROPRIETARY" in ownership_upper:
+                score += 20
+                log.debug(f"  {record.agency_name}: +20 (PROPRIETARY)")
+            elif "NON-PROFIT" in ownership_upper or "GOVERNMENT" in ownership_upper:
+                score -= 10
+                log.debug(f"  {record.agency_name}: -10 (NON-PROFIT/GOVERNMENT)")
+        
+        if record.star_rating and record.star_rating.strip() and record.star_rating.strip() != "-":
+            try:
+                rating = float(record.star_rating)
+                if 3.0 <= rating <= 4.0:
+                    score += 25
+                    log.debug(f"  {record.agency_name}: +25 (rating {rating})")
+                elif 1.0 <= rating <= 2.5:
+                    score -= 20
+                    log.debug(f"  {record.agency_name}: -20 (rating {rating})")
+            except ValueError:
+                pass
+        
+        record.lead_score = max(0, min(100, score))
+    
+    log.info(f"  ✓ Calculated lead scores for {len(records)} agencies")
+    
+    records = sorted(records, key=lambda r: r.lead_score, reverse=True)
+    log.info(f"  ✓ Sorted by lead_score (descending)")
+    
+    return records
 
 
 def export_to_csv(records: list[HHARecord], output_file: str):
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 4: CSV EXPORT")
+    log.info("STAGE 5: CSV EXPORT")
     log.info("=" * 70)
     
     df = pd.DataFrame([asdict(r) for r in records])
     
     col_order = [
+        "lead_score", "star_rating", "ownership_type",
         "agency_name", "owner_name", "owner_title", "owner_email", "email_source",
         "phone", "address", "city", "state", "zip_code",
-        "website", "cms_ccn", "apollo_org_id"
+        "website", "cms_ccn"
     ]
     df = df[[c for c in col_order if c in df.columns]]
-    
-    df.sort_values("agency_name", inplace=True)
     
     df.to_csv(output_file, index=False, encoding="utf-8")
     
@@ -571,8 +605,8 @@ def export_to_csv(records: list[HHARecord], output_file: str):
 async def run_pipeline(test_mode: bool = False):
     log.info("")
     log.info("╔" + "═" * 68 + "╗")
-    log.info("║  HEALTHCARE AGENCIES FL PIPELINE v1.0                               ║")
-    log.info("║  Florida Home Health Agency Lead Generator                         ║")
+    log.info("║  HEALTHCARE AGENCIES MULTI-STATE PIPELINE v2.1 (FL/TX/AZ)           ║")
+    log.info("║  Home Health Agency Lead Generator (score-first, VIP Places/Hunter)  ║")
     log.info("╚" + "═" * 68 + "╝")
     log.info("")
     
@@ -589,13 +623,27 @@ async def run_pipeline(test_mode: bool = False):
         log.error("No records extracted. Exiting.")
         return
     
+    records = calculate_lead_scores(records)
+    
+    before_vip = len(records)
+    records = [r for r in records if r.lead_score >= 95]
+    dropped = before_vip - len(records)
+    log.info("")
+    log.info(f"  VIP filter (lead_score >= 95): kept {len(records)} / {before_vip} records (dropped {dropped})")
+    
+    if not records:
+        log.error("No records with lead_score >= 95. Exiting.")
+        return
+    
     records = await discover_domains(records)
+    
+    records = apply_anti_franchise_filter(records)
     
     records = await enrich_all(records)
     
     output_file = OUTPUT_FILE
     if test_mode:
-        output_file = "healthcare_agencies_fl_leads_TEST.csv"
+        output_file = "healthcare_agencies_fl_tx_az_leads_TEST.csv"
     
     export_to_csv(records, output_file)
     
@@ -607,7 +655,7 @@ async def run_pipeline(test_mode: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Healthcare Agencies FL Pipeline — Florida Home Health Agency Lead Generator"
+        description="Healthcare Agencies Pipeline — FL/TX/AZ Home Health leads (score-first, VIP Places + Hunter)"
     )
     parser.add_argument(
         "--test",
@@ -616,11 +664,12 @@ def main():
     )
     args = parser.parse_args()
     
-    if not APOLLO_API_KEY:
-        log.warning("⚠ APOLLO_API_KEY not set. Enrichment will be limited.")
-        log.warning("  export APOLLO_API_KEY='your_key'")
+    if not GOOGLE_PLACES_API_KEY:
+        log.warning("⚠ GOOGLE_PLACES_API_KEY not set. Domain discovery will be skipped.")
+        log.warning("  export GOOGLE_PLACES_API_KEY='your_key'")
+    
     if not HUNTER_API_KEY:
-        log.warning("⚠ HUNTER_API_KEY not set. Hunter fallback disabled.")
+        log.warning("⚠ HUNTER_API_KEY not set. Enrichment will be disabled.")
         log.warning("  export HUNTER_API_KEY='your_key'")
     
     asyncio.run(run_pipeline(test_mode=args.test))
