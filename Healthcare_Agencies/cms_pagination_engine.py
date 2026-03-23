@@ -39,6 +39,26 @@ AGGREGATOR_DOMAINS = [
     "npino.com", "senioradvice.com", "github.io"
 ]
 
+# Pre-discovery blocklist: national franchises + hospital / health-system names (before Places spend).
+ENTERPRISE_BLOCKLIST_KEYWORDS = [
+    "AMEDISYS", "LHC GROUP", "BAYADA", "ENHABIT", "ENCOMPASS", "CENTERWELL",
+    "INTERIM", "KINDRED", "MAXIM", "BROOKDALE", "ACCENTCARE", "COMPASSUS",
+    "HOSPITAL", "CLINIC", "HCA", "ASCENSION", "CHRISTUS", "DIGNITY",
+    "ADVENTHEALTH", "MEMORIAL", "REGIONAL", "MEDICAL CENTER", "HEALTH SYSTEM",
+]
+
+# Pre-discovery blocklist: penalize national franchise brands in scoring (before Places spend).
+FRANCHISE_KEYWORDS = [
+    "AMEDISYS", "LHC", "BAYADA", "ENHABIT", "ENCOMPASS", "CENTERWELL",
+    "INTERIM", "KINDRED", "MAXIM", "BROOKDALE", "ACCENTCARE", "COMPASSUS",
+]
+
+ENTERPRISE_DOMAINS = [
+    "lhcgroup.com", "centerwell.com", "bayada.com", "interimhealthcare.com",
+    "compassus.com", "christushealth.org", "hcahoustonhealthcare.com",
+    "brooksrehab.org", "vnahg.org", "locations.dignityhealth.org",
+]
+
 @dataclass
 class HHARecord:
     agency_name: str = ""
@@ -299,7 +319,7 @@ def apply_anti_franchise_filter(
     """
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 3.5: ANTI-FRANCHISE FILTER")
+    log.info("STAGE 5: ANTI-FRANCHISE FILTER")
     log.info("=" * 70)
 
     def norm_site(w: str) -> str:
@@ -424,7 +444,7 @@ class EnrichmentClient:
 async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 4: HUNTER ENRICHMENT (VIP LEADS)")
+    log.info("STAGE 6: HUNTER ENRICHMENT (VIP LEADS)")
     log.info("=" * 70)
     
     if not HUNTER_API_KEY:
@@ -534,10 +554,13 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
     return final_records
 
 
-def calculate_lead_scores(records: list[HHARecord]) -> list[HHARecord]:
+def calculate_initial_scores(records: list[HHARecord]) -> list[HHARecord]:
+    """
+    Initial scoring from CMS + agency name only (no website / Places data).
+    """
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 2: LEAD SCORING")
+    log.info("STAGE 2: INITIAL LEAD SCORING (CMS + NAME BLOCKLISTS)")
     log.info("=" * 70)
     
     for record in records:
@@ -564,20 +587,48 @@ def calculate_lead_scores(records: list[HHARecord]) -> list[HHARecord]:
             except ValueError:
                 pass
         
+        name_upper = record.agency_name.upper()
+        if any(kw in name_upper for kw in ENTERPRISE_BLOCKLIST_KEYWORDS):
+            score -= 100
+            log.debug(f"  [{record.agency_name}]: -100 (ENTERPRISE BLOCKLIST)")
+        if any(kw in name_upper for kw in FRANCHISE_KEYWORDS):
+            score -= 50
+            log.debug(f"  [{record.agency_name}]: -50 (FRANCHISE BLOCKLIST)")
+        
         record.lead_score = max(0, min(100, score))
     
-    log.info(f"  ✓ Calculated lead scores for {len(records)} agencies")
+    log.info(f"  ✓ Initial scores computed for {len(records)} agencies (no domain data)")
     
-    records = sorted(records, key=lambda r: r.lead_score, reverse=True)
-    log.info(f"  ✓ Sorted by lead_score (descending)")
+    return records
+
+
+def apply_domain_penalties(records: list[HHARecord]) -> list[HHARecord]:
+    """
+    After Places discovery: penalize enterprise domains on record.website.
+    """
+    log.info("")
+    log.info("=" * 70)
+    log.info("STAGE 4: ENTERPRISE DOMAIN PENALTIES")
+    log.info("=" * 70)
     
+    penalized = 0
+    for record in records:
+        website_lower = (record.website or "").lower()
+        if website_lower and any(d in website_lower for d in ENTERPRISE_DOMAINS):
+            record.lead_score -= 100
+            penalized += 1
+            log.warning(
+                f"  [{record.agency_name}]: -100 (ENTERPRISE DOMAIN BLOCKLIST)"
+            )
+    
+    log.info(f"  ✓ Domain penalty applied to {penalized} record(s)")
     return records
 
 
 def export_to_csv(records: list[HHARecord], output_file: str):
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 5: CSV EXPORT")
+    log.info("STAGE 7: CSV EXPORT")
     log.info("=" * 70)
     
     df = pd.DataFrame([asdict(r) for r in records])
@@ -605,8 +656,8 @@ def export_to_csv(records: list[HHARecord], output_file: str):
 async def run_pipeline(test_mode: bool = False):
     log.info("")
     log.info("╔" + "═" * 68 + "╗")
-    log.info("║  HEALTHCARE AGENCIES MULTI-STATE PIPELINE v2.1 (FL/TX/AZ)           ║")
-    log.info("║  Home Health Agency Lead Generator (score-first, VIP Places/Hunter)  ║")
+    log.info("║  HEALTHCARE AGENCIES MULTI-STATE PIPELINE v2.3 (FL/TX/AZ)           ║")
+    log.info("║  CMS score → VIP pre-cut → Places → domain penalty → franchise → VIP ║")
     log.info("╚" + "═" * 68 + "╝")
     log.info("")
     
@@ -623,21 +674,40 @@ async def run_pipeline(test_mode: bool = False):
         log.error("No records extracted. Exiting.")
         return
     
-    records = calculate_lead_scores(records)
+    records = calculate_initial_scores(records)
     
-    before_vip = len(records)
+    before_first_cut = len(records)
     records = [r for r in records if r.lead_score >= 95]
-    dropped = before_vip - len(records)
+    dropped_first = before_first_cut - len(records)
     log.info("")
-    log.info(f"  VIP filter (lead_score >= 95): kept {len(records)} / {before_vip} records (dropped {dropped})")
+    log.info(
+        f"  FIRST CUT (lead_score >= 95, pre-Places): kept {len(records)} / {before_first_cut} "
+        f"(dropped {dropped_first})"
+    )
     
     if not records:
-        log.error("No records with lead_score >= 95. Exiting.")
+        log.error("No survivors after initial VIP cut — skipping Google Places. Exiting.")
         return
     
     records = await discover_domains(records)
     
+    records = apply_domain_penalties(records)
+    
     records = apply_anti_franchise_filter(records)
+    
+    before_final_cut = len(records)
+    records = [r for r in records if r.lead_score >= 95]
+    dropped_final = before_final_cut - len(records)
+    records = sorted(records, key=lambda r: r.lead_score, reverse=True)
+    log.info("")
+    log.info(
+        f"  FINAL CUT & SORT (lead_score >= 95 post-domain/franchise): "
+        f"kept {len(records)} / {before_final_cut} (dropped {dropped_final}), sorted desc"
+    )
+    
+    if not records:
+        log.error("No records with lead_score >= 95 after domain penalties / franchise filter. Exiting.")
+        return
     
     records = await enrich_all(records)
     
@@ -655,7 +725,7 @@ async def run_pipeline(test_mode: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Healthcare Agencies Pipeline — FL/TX/AZ Home Health leads (score-first, VIP Places + Hunter)"
+        description="Healthcare Agencies Pipeline — FL/TX/AZ (two-stage score, Places only on VIP pre-cut)"
     )
     parser.add_argument(
         "--test",
