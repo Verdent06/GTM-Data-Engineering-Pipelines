@@ -35,6 +35,11 @@ MAX_HUNTER_VIP_ENRICHMENTS = 100
 # Hunter.io account ceiling (for logging only).
 HUNTER_ACCOUNT_CREDIT_LIMIT = 500
 
+# Pre-Places: allow lower initial scores through (continuous scoring + post-enrich bump).
+INITIAL_PRE_PLACES_MIN_SCORE = 75
+# Post domain/franchise filter + Hunter eligibility.
+POST_FILTER_MIN_SCORE = 80
+
 AGGREGATOR_DOMAINS = [
     "npino.com", "senioradvice.com", "github.io"
 ]
@@ -458,7 +463,7 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
     low_score_count = 0
     
     for r in records:
-        if r.lead_score < 95:
+        if r.lead_score < POST_FILTER_MIN_SCORE:
             low_score_count += 1
             continue
         
@@ -473,8 +478,8 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
         
         valid_for_enrichment.append(r)
     
-    log.info(f"  Records with Score >= 95: {len(valid_for_enrichment)}")
-    log.info(f"  Records with Score < 95: {low_score_count}")
+    log.info(f"  Records with Score >= {POST_FILTER_MIN_SCORE}: {len(valid_for_enrichment)}")
+    log.info(f"  Records with Score < {POST_FILTER_MIN_SCORE}: {low_score_count}")
     log.info(f"  Records without domains: {no_domain_count}")
     log.info(f"  Records with blocked domains: {blocked_count}")
     
@@ -495,7 +500,7 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
         f"(1 per domain); account ceiling {HUNTER_ACCOUNT_CREDIT_LIMIT} credits."
     )
     log.info(
-        f"  VIP pool: {len(valid_for_enrichment)} eligible (score 95+, valid domain). "
+        f"  VIP pool: {len(valid_for_enrichment)} eligible (score {POST_FILTER_MIN_SCORE}+, valid domain). "
         f"Enriching first {len(to_enrich)} only (slice [:MAX_HUNTER_VIP_ENRICHMENTS] enforced)."
     )
     
@@ -557,6 +562,7 @@ async def enrich_all(records: list[HHARecord]) -> list[HHARecord]:
 def calculate_initial_scores(records: list[HHARecord]) -> list[HHARecord]:
     """
     Initial scoring from CMS + agency name only (no website / Places data).
+    Continuous star contribution (rating * 5); score is uncapped until post-enrichment bump.
     """
     log.info("")
     log.info("=" * 70)
@@ -564,7 +570,7 @@ def calculate_initial_scores(records: list[HHARecord]) -> list[HHARecord]:
     log.info("=" * 70)
     
     for record in records:
-        score = 50
+        score = 40.0
         
         if record.ownership_type:
             ownership_upper = record.ownership_type.upper()
@@ -578,12 +584,8 @@ def calculate_initial_scores(records: list[HHARecord]) -> list[HHARecord]:
         if record.star_rating and record.star_rating.strip() and record.star_rating.strip() != "-":
             try:
                 rating = float(record.star_rating)
-                if 3.0 <= rating <= 4.0:
-                    score += 25
-                    log.debug(f"  {record.agency_name}: +25 (rating {rating})")
-                elif 1.0 <= rating <= 2.5:
-                    score -= 20
-                    log.debug(f"  {record.agency_name}: -20 (rating {rating})")
+                score += rating * 5
+                log.debug(f"  {record.agency_name}: +{rating * 5:.1f} (star × 5, rating={rating})")
             except ValueError:
                 pass
         
@@ -595,10 +597,39 @@ def calculate_initial_scores(records: list[HHARecord]) -> list[HHARecord]:
             score -= 50
             log.debug(f"  [{record.agency_name}]: -50 (FRANCHISE BLOCKLIST)")
         
-        record.lead_score = max(0, min(100, score))
+        record.lead_score = int(round(score))
     
-    log.info(f"  ✓ Initial scores computed for {len(records)} agencies (no domain data)")
+    log.info(
+        f"  ✓ Initial scores computed for {len(records)} agencies "
+        f"(continuous stars, uncapped; pre-Places cutoff ≥{INITIAL_PRE_PLACES_MIN_SCORE})"
+    )
     
+    return records
+
+
+def apply_actionability_bump(records: list[HHARecord]) -> list[HHARecord]:
+    """
+    Post-Hunter: +15 when a real email is present; cap all scores at 100.
+    """
+    log.info("")
+    log.info("=" * 70)
+    log.info("STAGE 7: ACTIONABILITY BUMP (POST-ENRICHMENT)")
+    log.info("=" * 70)
+    
+    bumped = 0
+    for record in records:
+        email = (record.owner_email or "").strip()
+        if (
+            email
+            and email.lower() != "not_found"
+            and "@" in email
+        ):
+            record.lead_score += 15
+            bumped += 1
+            log.debug(f"  [{record.agency_name}]: +15 (actionability / email found)")
+        record.lead_score = min(100, record.lead_score)
+    
+    log.info(f"  ✓ Actionability bump: +15 applied to {bumped} record(s); all scores capped at 100")
     return records
 
 
@@ -628,7 +659,7 @@ def apply_domain_penalties(records: list[HHARecord]) -> list[HHARecord]:
 def export_to_csv(records: list[HHARecord], output_file: str):
     log.info("")
     log.info("=" * 70)
-    log.info("STAGE 7: CSV EXPORT")
+    log.info("STAGE 8: CSV EXPORT")
     log.info("=" * 70)
     
     df = pd.DataFrame([asdict(r) for r in records])
@@ -656,8 +687,8 @@ def export_to_csv(records: list[HHARecord], output_file: str):
 async def run_pipeline(test_mode: bool = False):
     log.info("")
     log.info("╔" + "═" * 68 + "╗")
-    log.info("║  HEALTHCARE AGENCIES MULTI-STATE PIPELINE v2.3 (FL/TX/AZ)           ║")
-    log.info("║  CMS score → VIP pre-cut → Places → domain penalty → franchise → VIP ║")
+    log.info("║  HEALTHCARE AGENCIES MULTI-STATE PIPELINE v2.4 (FL/TX/AZ)           ║")
+    log.info("║  Continuous score → pre-75 cut → Places → penalties → bump → export   ║")
     log.info("╚" + "═" * 68 + "╝")
     log.info("")
     
@@ -677,12 +708,12 @@ async def run_pipeline(test_mode: bool = False):
     records = calculate_initial_scores(records)
     
     before_first_cut = len(records)
-    records = [r for r in records if r.lead_score >= 95]
+    records = [r for r in records if r.lead_score >= INITIAL_PRE_PLACES_MIN_SCORE]
     dropped_first = before_first_cut - len(records)
     log.info("")
     log.info(
-        f"  FIRST CUT (lead_score >= 95, pre-Places): kept {len(records)} / {before_first_cut} "
-        f"(dropped {dropped_first})"
+        f"  FIRST CUT (lead_score >= {INITIAL_PRE_PLACES_MIN_SCORE}, pre-Places): "
+        f"kept {len(records)} / {before_first_cut} (dropped {dropped_first})"
     )
     
     if not records:
@@ -696,20 +727,27 @@ async def run_pipeline(test_mode: bool = False):
     records = apply_anti_franchise_filter(records)
     
     before_final_cut = len(records)
-    records = [r for r in records if r.lead_score >= 95]
+    records = [r for r in records if r.lead_score >= POST_FILTER_MIN_SCORE]
     dropped_final = before_final_cut - len(records)
     records = sorted(records, key=lambda r: r.lead_score, reverse=True)
     log.info("")
     log.info(
-        f"  FINAL CUT & SORT (lead_score >= 95 post-domain/franchise): "
+        f"  FINAL CUT & SORT (lead_score >= {POST_FILTER_MIN_SCORE} post-domain/franchise): "
         f"kept {len(records)} / {before_final_cut} (dropped {dropped_final}), sorted desc"
     )
     
     if not records:
-        log.error("No records with lead_score >= 95 after domain penalties / franchise filter. Exiting.")
+        log.error(
+            f"No records with lead_score >= {POST_FILTER_MIN_SCORE} after domain penalties / franchise filter. Exiting."
+        )
         return
     
     records = await enrich_all(records)
+    
+    records = apply_actionability_bump(records)
+    records = sorted(records, key=lambda r: r.lead_score, reverse=True)
+    log.info("")
+    log.info("  ✓ Final sort by lead_score (descending) after actionability bump")
     
     output_file = OUTPUT_FILE
     if test_mode:
