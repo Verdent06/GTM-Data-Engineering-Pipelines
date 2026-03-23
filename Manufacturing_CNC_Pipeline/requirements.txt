@@ -1,0 +1,2 @@
+# No external dependencies - uses Python stdlib only
+# csv, json, re, asyncio, urllib built-in
