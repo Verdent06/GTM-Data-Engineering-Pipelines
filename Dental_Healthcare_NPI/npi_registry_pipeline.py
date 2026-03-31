@@ -5,9 +5,12 @@ import logging
 import os
 import argparse
 import re
+import json
 from dataclasses import dataclass, asdict
 from typing import Optional
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+import google.generativeai as genai
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,7 +20,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OUTPUT_FILE = "dental_clinics_leads.csv"
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 DEFAULT_CLINIC_LIMIT = 150
 TEST_MAX_CLINICS = 5
@@ -36,7 +43,7 @@ AGGREGATOR_DOMAINS = [
     "facebook.com", "linkedin.com", "twitter.com", "instagram.com",
     "nextdoor.com", "thumbtack.com", "alignable.com",
     "yellowpages.com", "whitepages.com", "superpages.com", "manta.com",
-    "bbb.org", "dandb.com",
+    "bbb.org", "dandb.com", "zhihu.com",
     "indeed.com", "glassdoor.com", "ziprecruiter.com", "careerbuilder.com",
     "cms.gov", "google.com", "bing.com", "youtube.com", "wikipedia.org",
     "amazon.com", "apps.apple.com", "play.google.com",
@@ -76,6 +83,9 @@ class DentalClinicRecord:
     contact_title: str = ""
     contact_email: str = ""
     email_source: str = ""
+    icp_score: int = 0
+    booking_system: str = ""
+    agentic_reasoning: str = ""
 
 
 def _is_aggregator_domain(domain: str) -> bool:
@@ -158,6 +168,190 @@ def _extract_root_domain(url: str) -> str:
         return domain
     except Exception:
         return ""
+
+
+async def scrape_homepage_text(session: aiohttp.ClientSession, url: str) -> str:
+    """Scrape visible text from a clinic homepage.
+    
+    Args:
+        session: aiohttp ClientSession
+        url: Website URL to scrape
+    
+    Returns:
+        Visible text (max 4000 chars), or empty string on error
+    """
+    if not url or not url.strip():
+        return ""
+    
+    # Ensure URL has protocol
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    
+    try:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=10),
+            ssl=False,  # Handle SSL certificate errors gracefully
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+        ) as resp:
+            if resp.status != 200:
+                log.warning(f"      Scrape: HTTP {resp.status} for '{url}'")
+                return ""
+            
+            html = await resp.text()
+    
+    except asyncio.TimeoutError:
+        log.warning(f"      Scrape: Timeout (10s) for '{url}'")
+        return ""
+    except aiohttp.ClientSSLError:
+        log.warning(f"      Scrape: SSL error for '{url}'")
+        return ""
+    except Exception as e:
+        log.warning(f"      Scrape: Error for '{url}': {type(e).__name__}")
+        return ""
+    
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # Remove script, style, and header tags
+        for element in soup(["script", "style", "header", "nav", "footer"]):
+            element.decompose()
+        
+        # Count click-to-call (tel:) links before extracting text
+        tel_links = soup.find_all("a", href=True)
+        tel_count = sum(1 for link in tel_links if link["href"].startswith("tel:"))
+        
+        # Get visible text
+        text = soup.get_text()
+        
+        # Clean whitespace
+        lines = (line.strip() for line in text.splitlines())
+        text = " ".join(line for line in lines if line)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Prepend system note about tel: links
+        if tel_count > 0:
+            system_note = f"[SYSTEM NOTE: Found {tel_count} click-to-call (tel:) links hidden in the HTML buttons.] "
+            text = system_note + text
+        
+        # Return max 4000 characters
+        return text[:4000]
+    
+    except Exception as e:
+        log.warning(f"      Scrape: Parse error for '{url}': {e}")
+        return ""
+
+
+async def score_clinic_for_voice_ai(homepage_text: str) -> dict:
+    """Score clinic using Gemini for AI Voice Receptionist ICP fit.
+    
+    Args:
+        homepage_text: Visible text from clinic homepage (up to 4000 chars)
+    
+    Returns:
+        Dictionary with icp_score (1-100), booking_system, and agentic_reasoning
+    """
+    if not homepage_text or not homepage_text.strip():
+        return {
+            "icp_score": 0,
+            "booking_system": "Unknown",
+            "agentic_reasoning": "No homepage text available for analysis."
+        }
+    
+    if not GEMINI_API_KEY:
+        log.warning("      Score: GEMINI_API_KEY not set, returning default")
+        return {
+            "icp_score": 0,
+            "booking_system": "Unknown",
+            "agentic_reasoning": "Gemini API key not configured."
+        }
+    
+    prompt = f"""You are an AI evaluating this dental clinic's website for an AI Voice Receptionist product.
+
+STRICT SCORING RUBRIC - Follow these tiers RIGOROUSLY:
+
+TIER 1 (Score 90-100) - PRIME TARGETS:
+- The text explicitly says 'Call us to schedule' or similar phone-first language, OR
+- The [SYSTEM NOTE] indicates hidden 'tel:' click-to-call links used for booking
+- These clinics need a voice AI solution because phone is their primary booking method
+
+TIER 2 (Score 70-89) - AMBIGUOUS / MANUAL FORMS:
+- The text mentions 'request an appointment' or 'fill out the form' or 'email us'
+- BUT does NOT mention any modern digital booking software
+- These clinics rely on emails/forms and are excellent targets for voice AI automation
+
+TIER 3 (Score 10-30) - DISQUALIFIED:
+- The text explicitly mentions third-party scheduling portals such as:
+  ZocDoc, NexHealth, LocalMed, PatientReach, Calendly, Schedule Online Now, Online Portal, etc.
+- These clinics already have digital booking and are NOT targets for voice AI
+
+Analyze the clinic homepage text strictly against this rubric and determine:
+1. ICP Score (1-100): Use ONLY the tier ranges above. No scores between tiers (e.g., 50-60 is not valid).
+2. Booking System: What system do they use? (e.g., 'ZocDoc', 'Phone Only', 'Email/Form', 'None')
+3. Agentic Reasoning: A 1-sentence explanation of which tier applied and why.
+
+Return ONLY a JSON object with these exact keys:
+{{"icp_score": <int 1-100>, "booking_system": "<string>", "agentic_reasoning": "<string>"}}
+
+Clinic Homepage Text:
+{homepage_text}"""
+    
+    try:
+        model = genai.GenerativeModel(
+            "gemini-2.5-flash-lite",
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.3,  # Low temperature for consistent scoring
+            }
+        )
+        
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt
+        )
+        
+        response_text = response.text.strip()
+        
+        # Try to parse JSON from response
+        try:
+            result = json.loads(response_text)
+            
+            # Validate required keys
+            if all(key in result for key in ["icp_score", "booking_system", "agentic_reasoning"]):
+                # Clamp icp_score to 1-100
+                icp_score = max(1, min(100, int(result.get("icp_score", 0))))
+                
+                return {
+                    "icp_score": icp_score,
+                    "booking_system": str(result.get("booking_system", "Unknown")).strip()[:100],
+                    "agentic_reasoning": str(result.get("agentic_reasoning", ""))
+                }
+            else:
+                log.warning(f"      Score: Missing required keys in Gemini response")
+                return {
+                    "icp_score": 0,
+                    "booking_system": "Unknown",
+                    "agentic_reasoning": "Failed to parse Gemini response."
+                }
+            
+        
+        except json.JSONDecodeError as e:
+            log.warning(f"      Score: JSON parse error: {e}")
+            log.warning(f"      Score: Raw response: {response_text[:200]}")
+            return {
+                "icp_score": 0,
+                "booking_system": "Unknown",
+                "agentic_reasoning": "Gemini response parsing failed."
+            }
+    
+    except Exception as e:
+        log.error(f"      Score: Gemini error: {type(e).__name__}: {e}")
+        return {
+            "icp_score": 0,
+            "booking_system": "Unknown",
+            "agentic_reasoning": f"Scoring error: {type(e).__name__}"
+        }
 
 
 async def fetch_npi_clinics(session: aiohttp.ClientSession, target_limit: int = DEFAULT_CLINIC_LIMIT) -> list[DentalClinicRecord]:
@@ -534,6 +728,7 @@ def export_to_csv(records: list[DentalClinicRecord], output_file: str):
     
     col_order = [
         "clinic_name", "city", "state", "website",
+        "icp_score", "booking_system", "agentic_reasoning",
         "contact_name", "contact_title", "contact_email", "email_source"
     ]
     df = df[[c for c in col_order if c in df.columns]]
@@ -552,6 +747,70 @@ def export_to_csv(records: list[DentalClinicRecord], output_file: str):
         email_rate = df['contact_email'].ne('').sum() / len(df) * 100
         log.info(f"    Website coverage:  {website_rate:.1f}%")
         log.info(f"    Email coverage:    {email_rate:.1f}%")
+
+
+async def agentic_scoring_stage(session: aiohttp.ClientSession, records: list[DentalClinicRecord]) -> list[DentalClinicRecord]:
+    """Score clinics using Gemini for Patientdesk.ai ICP fit.
+    
+    Filters out Tier 3 (score < 70) clinics to save Hunter.io API credits.
+    """
+    log.info("")
+    log.info("=" * 70)
+    log.info("STAGE 3.5: AGENTIC ICP SCORING (Patientdesk.ai)")
+    log.info("=" * 70)
+    
+    if not records:
+        log.info("  No records to score. Exiting.")
+        return records
+    
+    log.info(f"  Will score {len(records)} clinics for voice AI fit")
+    log.info("")
+    
+    scored_records = []
+    scored_count = 0
+    
+    for i, rec in enumerate(records):
+        if not rec.website or not rec.website.strip():
+            log.info(f"  [{i+1}/{len(records)}] {rec.clinic_name[:40]}... ⚠ NO WEBSITE")
+            continue
+        
+        log.info(f"  [{i+1}/{len(records)}] {rec.clinic_name[:40]}...")
+        log.info(f"    Domain: {rec.website}")
+        
+        # Scrape homepage
+        homepage_text = await scrape_homepage_text(session, rec.website)
+        
+        if not homepage_text:
+            log.info(f"    ⚠ Failed to scrape homepage")
+            rec.icp_score = 0
+            rec.agentic_reasoning = "Failed to scrape homepage text."
+            continue
+        
+        # Score clinic
+        score_result = await score_clinic_for_voice_ai(homepage_text)
+        
+        rec.icp_score = score_result.get("icp_score", 0)
+        rec.booking_system = score_result.get("booking_system", "Unknown")
+        rec.agentic_reasoning = score_result.get("agentic_reasoning", "")
+        
+        log.info(f"    ✓ Score: {rec.icp_score}/100 | System: {rec.booking_system}")
+        log.info(f"    Reasoning: {rec.agentic_reasoning[:70]}...")
+        
+        scored_count += 1
+        await asyncio.sleep(1)
+    
+    # Filter: ONLY keep records with icp_score >= 70 (Tier 1 & 2)
+    filtered_records = [r for r in records if r.icp_score >= 70]
+    dropped_count = len(records) - len(filtered_records)
+    
+    log.info("")
+    log.info(f"  Scoring Summary:")
+    log.info(f"    ✓ Scored: {scored_count}/{len(records)}")
+    log.info(f"    ✓ Kept (Score >= 70): {len(filtered_records)} (Tier 1 & 2 targets)")
+    log.info(f"    ✗ Dropped (Score < 70): {dropped_count} (Tier 3 disqualified)")
+    log.info(f"    🎯 Efficiency: {len(filtered_records)} qualified leads ready for Hunter.io enrichment")
+    
+    return filtered_records
 
 
 async def run_pipeline(clinic_limit: int = DEFAULT_CLINIC_LIMIT, test_mode: bool = False):
@@ -576,6 +835,13 @@ async def run_pipeline(clinic_limit: int = DEFAULT_CLINIC_LIMIT, test_mode: bool
         return
     
     records = await discover_domains(records)
+    
+    async with aiohttp.ClientSession() as session:
+        records = await agentic_scoring_stage(session, records)
+    
+    if not records:
+        log.error("No clinics qualified after agentic scoring. Exiting.")
+        return
     
     hunter_limit = TEST_MAX_HUNTER_CALLS if test_mode else None
     records = await enrich_all(records, max_api_calls=hunter_limit)
