@@ -285,34 +285,56 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(1)
 
-    test_handle = "@mrbeast"
+    # The Batch Processing Target List
+    target_handles = [
+        "@mrbeast", 
+        "@mkbhd", 
+        "@emmachamberlain", 
+        "@colinandsamir", 
+        "@cleoabram"
+    ]
 
-    try:
-        profile = build_creator_risk_profile(test_handle, api_key)
-    except (RuntimeError, ValueError) as exc:
-        logger.error("Pipeline failed: %s", exc)
-        sys.exit(1)
+    batch_payload = []
 
-    # Terminal JSON payload (creator risk profile)
-    payload = {
-        "creator_risk_profile": {
-            "handle": profile["handle"],
-            "channel_id": profile["channel_id"],
-            "subscriber_count": profile["subscriber_count"],
-            "v15_average_views": profile["v15_average_views"],
-            "recent_engagement_rate_percent": profile["recent_engagement_rate_percent"],
-        },
-        "pipeline_metadata": {
-            "recent_video_sample_size": profile["recent_video_sample_size"],
-            "channel_lifetime_view_count": profile["channel_lifetime_view_count"],
-            "uploads_playlist_id": profile["uploads_playlist_id"],
-            "recent_totals": profile["recent_totals"],
-        },
+    logger.info("Starting batch underwriting process for %d creators...", len(target_handles))
+
+    for handle in target_handles:
+        logger.info("--------------------------------------------------")
+        logger.info("Processing target: %s", handle)
+        try:
+            profile = build_creator_risk_profile(handle, api_key)
+            
+            creator_data = {
+                "creator_risk_profile": {
+                    "handle": profile["handle"],
+                    "channel_id": profile["channel_id"],
+                    "subscriber_count": profile["subscriber_count"],
+                    "v15_average_views": profile["v15_average_views"],
+                    "recent_engagement_rate_percent": profile["recent_engagement_rate_percent"],
+                },
+                "pipeline_metadata": {
+                    "recent_video_sample_size": profile["recent_video_sample_size"],
+                    "channel_lifetime_view_count": profile["channel_lifetime_view_count"],
+                    "uploads_playlist_id": profile["uploads_playlist_id"],
+                    "recent_totals": profile["recent_totals"],
+                }
+            }
+            batch_payload.append(creator_data)
+        except (RuntimeError, ValueError) as exc:
+            logger.error("Pipeline failed for %s: %s", handle, exc)
+            # We don't exit here. We catch the error and keep processing the rest of the batch!
+
+    # Final Master Payload
+    final_output = {
+        "batch_job_status": "SUCCESS",
+        "creators_processed": len(batch_payload),
+        "underwriting_data": batch_payload
     }
 
-    print()
-    print("=== Creator Risk Profile (JSON) ===")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print("\n" + "="*50)
+    print("=== Batch Creator Risk Profiles (JSON) ===")
+    print("="*50)
+    print(json.dumps(final_output, indent=2, ensure_ascii=False))
     print()
 
 
